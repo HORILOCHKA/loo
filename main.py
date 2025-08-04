@@ -10,6 +10,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 # Налаштування системи логування (для відображення інформації про роботу скрипта)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,6 +52,19 @@ class TelegramMonitor:
         # 🔗 Створення Telegram клієнта
         # 'session_name' - файл для збереження сесії (щоб не авторизуватися щоразу)
         self.client = TelegramClient('session_name', api_id, api_hash)
+        
+        # ⏰ Час останньої перевірки повідомлень (з timezone)
+        self.last_check_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+        
+        # 📊 Час останнього статус повідомлення
+        self.last_status_time = datetime.now(timezone.utc)
+        
+        # 📈 Статистика роботи бота
+        self.stats = {
+            'total_checks': 0,
+            'total_messages_found': 0,
+            'start_time': datetime.now(timezone.utc)
+        }
 
     def load_keywords(self):
         """
@@ -131,14 +145,11 @@ class TelegramMonitor:
             # 📋 Отримання списку всіх груп та каналів для моніторингу
             await self.get_all_chats()
 
-            # 👂 Запуск обробника нових повідомлень
-            self.setup_message_handler()
-
-            logger.info("🎯 Моніторинг розпочато. Очікування повідомлень...")
+            logger.info("🎯 Моніторинг розпочато. Перевірка кожні 5 хвилин...")
             logger.info("⏹️  Для зупинки натисніть Ctrl+C")
 
-            # 🔄 Безкінечний цикл моніторингу
-            await self.client.run_until_disconnected()
+            # 🔄 Безкінечний цикл моніторингу з перевіркою кожні 5 хвилин
+            await self.periodic_check_loop()
 
         except Exception as e:
             logger.error(f"❌ Помилка запуску: {e}")
@@ -172,55 +183,114 @@ class TelegramMonitor:
         except Exception as e:
             logger.error(f"❌ Помилка отримання списку чатів: {e}")
 
-    def setup_message_handler(self):
+    async def periodic_check_loop(self):
         """
-        👂 Налаштування обробника нових повідомлень
-
-        Цей метод створює "слухача", який реагує на кожне нове повідомлення
-        у всіх групах/каналах та перевіряє їх на наявність ключових слів
+        🔄 Основний цикл періодичної перевірки повідомлень кожні 5 хвилин
+        з відправкою статусу кожні 10 хвилин
         """
-
-        @self.client.on(events.NewMessage)  # 🎯 Декоратор для обробки нових повідомлень
-        async def message_handler(event):
+        while True:
             try:
-                # 🚫 Пропускаємо власні повідомлення (щоб не спамити собі)
-                if event.is_private and event.sender_id == (await self.client.get_me()).id:
-                    return
-
-                # 📝 Отримання інформації про чат та відправника
-                chat = await event.get_chat()
-                sender = await event.get_sender()
-
-                # 🔍 Перевірка чи це група або канал (пропускаємо приватні чати)
-                if not (hasattr(chat, 'megagroup') or hasattr(chat, 'broadcast') or
-                        hasattr(chat, 'title')):
-                    return
-
-                # 📄 Отримання тексту повідомлення
-                message_text = event.message.message
-                if not message_text:
-                    return  # Пропускаємо повідомлення без тексту (фото, стікери тощо)
-
-                # 🔎 Перевірка наявності ключових слів у повідомленні
-                found_keywords = self.check_keywords(message_text)
-
-                # 📤 Якщо знайдено ключові слова - пересилаємо повідомлення
-                if found_keywords:
-                    await self.forward_message(event, chat, sender, found_keywords)
-
+                logger.info("🔍 Початок перевірки нових повідомлень...")
+                messages_found = await self.check_recent_messages()
+                self.stats['total_checks'] += 1
+                self.stats['total_messages_found'] += messages_found
+                
+                logger.info("✅ Перевірка завершена. Очікування 5 хвилин...")
+                
+                # 📊 Перевірка чи потрібно відправити статус (кожні 10 хвилин)
+                await self.check_and_send_status()
+                
+                # ⏰ Очікування 5 хвилин (300 секунд)
+                await asyncio.sleep(300)
+                
             except Exception as e:
-                logger.error(f"❌ Помилка обробки повідомлення: {e}")
+                logger.error(f"❌ Помилка в циклі перевірки: {e}")
+                # Відправка повідомлення про помилку
+                await self.send_error_notification(str(e))
+                # Очікування 1 хвилину перед повторною спробою при помилці
+                await asyncio.sleep(60)
 
-    async def forward_message(self, event, chat, sender, keywords):
+    async def check_recent_messages(self):
         """
-        📤 Пересилання повідомлення з ключовими словами
+        🔍 Перевірка повідомлень за останні 5 хвилин у всіх групах/каналах
+        Повертає кількість знайдених повідомлень з ключовими словами
+        """
+        total_found = 0
+        try:
+            # 📞 Отримання всіх діалогів (чатів) користувача
+            dialogs = await self.client.get_dialogs()
+            current_time = datetime.now(timezone.utc)
+            
+            # 🔍 Перевірка кожної групи/каналу
+            for dialog in dialogs:
+                if dialog.is_group or dialog.is_channel:
+                    found_in_chat = await self.check_chat_messages(dialog, current_time)
+                    total_found += found_in_chat
+            
+            # 📅 Оновлення часу останньої перевірки
+            self.last_check_time = current_time
+            
+            return total_found
+            
+        except Exception as e:
+            logger.error(f"❌ Помилка перевірки повідомлень: {e}")
+            return 0
 
-        Формує детальне сповіщення та надсилає його цільовому користувачу
-        Включає інформацію про джерело, відправника та знайдені ключові слова
+    async def check_chat_messages(self, dialog, current_time):
+        """
+        📋 Перевірка повідомлень в конкретному чаті за останні 5 хвилин
+        Повертає кількість знайдених повідомлень з ключовими словами
+        """
+        messages_with_keywords = 0
+        try:
+            # 📥 Отримання останніх повідомлень (збільшуємо ліміт для надійності)
+            messages = await self.client.get_messages(
+                dialog,
+                limit=200  # Збільшений ліміт для кращого покриття
+            )
+            
+            messages_checked = 0
+            
+            # 🔎 Перевірка кожного повідомлення
+            for message in messages:
+                # ⏰ Перевірка чи повідомлення новіше за час останньої перевірки
+                if message.date <= self.last_check_time:
+                    continue
+                    
+                messages_checked += 1
+                
+                # 🚫 Пропускаємо власні повідомлення
+                if message.sender_id == (await self.client.get_me()).id:
+                    continue
+                
+                # 📄 Перевірка тексту повідомлення
+                if message.message:
+                    found_keywords = self.check_keywords(message.message)
+                    
+                    if found_keywords:
+                        messages_with_keywords += 1
+                        # 📤 Пересилання повідомлення з ключовими словами
+                        await self.forward_message_from_history(message, dialog, found_keywords)
+            
+            if messages_checked > 0:
+                logger.info(f"📊 {dialog.title}: перевірено {messages_checked} повідомлень, знайдено {messages_with_keywords} з ключовими словами")
+            
+            return messages_with_keywords
+                
+        except Exception as e:
+            logger.error(f"❌ Помилка перевірки чату {dialog.title}: {e}")
+            return 0
+
+    async def forward_message_from_history(self, message, dialog, keywords):
+        """
+        📤 Пересилання повідомлення з історії з ключовими словами
         """
         try:
+            # 👤 Отримання інформації про відправника
+            sender = await message.get_sender()
+            
             # 📝 Формування інформації про повідомлення
-            chat_name = getattr(chat, 'title', 'Невідомий чат')
+            chat_name = getattr(dialog, 'title', 'Невідомий чат')
             sender_name = f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '') or ''}".strip()
             sender_username = getattr(sender, 'username', '')
 
@@ -236,14 +306,14 @@ class TelegramMonitor:
 
 📍 Група/Канал: {chat_name}
 👤 Відправник: {sender_info}
-📅 Час: {event.message.date.strftime('%Y-%m-%d %H:%M:%S')}
+📅 Час: {message.date.strftime('%Y-%m-%d %H:%M:%S')}
 
 💬 Повідомлення:
-{event.message.message}
+{message.message}
 
 ---
-ID повідомлення: {event.message.id}
-ID чату: {chat.id}
+ID повідомлення: {message.id}
+ID чату: {dialog.id}
             """.strip()
 
             # 📨 Надсилання сповіщення цільовому користувачу
@@ -253,6 +323,76 @@ ID чату: {chat.id}
 
         except Exception as e:
             logger.error(f"❌ Помилка пересилання повідомлення: {e}")
+
+    async def check_and_send_status(self):
+        """
+        📊 Перевірка чи потрібно відправити статус повідомлення (кожні 10 хвилин)
+        """
+        try:
+            current_time = datetime.now(timezone.utc)
+            time_since_last_status = current_time - self.last_status_time
+            
+            # 🕙 Якщо пройшло 10 хвилин або більше - відправляємо статус
+            if time_since_last_status >= timedelta(minutes=10):
+                await self.send_status_message()
+                self.last_status_time = current_time
+                
+        except Exception as e:
+            logger.error(f"❌ Помилка перевірки статусу: {e}")
+
+    async def send_status_message(self):
+        """
+        📈 Відправка статус повідомлення про роботу бота
+        """
+        try:
+            current_time = datetime.now(timezone.utc)
+            uptime = current_time - self.stats['start_time']
+            
+            # 📊 Формування статистики
+            hours = int(uptime.total_seconds() // 3600)
+            minutes = int((uptime.total_seconds() % 3600) // 60)
+            
+            status_text = f"""
+🤖 СТАТУС БОТА - БОТ ПРАЦЮЄ
+
+⏰ Час роботи: {hours}г {minutes}хв
+🔍 Всього перевірок: {self.stats['total_checks']}
+📨 Знайдено повідомлень: {self.stats['total_messages_found']}
+📅 Останнє оновлення: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
+
+✅ Бот активний та моніторить групи кожні 5 хвилин
+🔑 Ключових слів у базі: {len(self.keywords)}
+
+---
+Наступний статус через 10 хвилин
+            """.strip()
+
+            # 📨 Відправка статус повідомлення
+            await self.client.send_message(self.target_user_id, status_text)
+            logger.info("📊 Відправлено статус повідомлення")
+            
+        except Exception as e:
+            logger.error(f"❌ Помилка відправки статусу: {e}")
+
+    async def send_error_notification(self, error_message):
+        """
+        ⚠️ Відправка повідомлення про помилку
+        """
+        try:
+            error_text = f"""
+⚠️ ПОМИЛКА В РОБОТІ БОТА
+
+❌ Опис помилки: {error_message}
+📅 Час помилки: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+
+🔄 Бот спробує відновити роботу через 1 хвилину
+            """.strip()
+
+            await self.client.send_message(self.target_user_id, error_text)
+            logger.info("⚠️ Відправлено повідомлення про помилку")
+            
+        except Exception as e:
+            logger.error(f"❌ Помилка відправки повідомлення про помилку: {e}")
 
 
 async def main():
